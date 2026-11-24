@@ -1,5 +1,6 @@
 import { db } from './db.js';
 import { readTags } from './id3.js';
+import { ytKey, loadApi, parseYouTubeId, cleanMeta, ytSearch, ytTitle, thumb } from './youtube.js';
 
 /* =========================================================
    Hilfsfunktionen
@@ -49,6 +50,10 @@ const I = {
   disc: P('<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/>'),
   moon: P('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'),
   link: P('<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>'),
+  shrink: P('<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>'),
+  expand: P('<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>'),
+  yt: P('<rect x="2.5" y="5" width="19" height="14" rx="4"/><path d="m10 9 5 3-5 3z" fill="currentColor"/>'),
+  key: P('<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.8-9.8M17 6l3 3M15 8l2 2"/>'),
   globe: P('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
 };
 const EQ = '<span class="eq"><i></i><i></i><i></i></span>';
@@ -71,6 +76,7 @@ const S = {
   sort: 'added',
   sleepAt: 0,
   sleepEnd: false,
+  video: 'big',        // YouTube-Video groß | klein
 };
 const LS_KEY = 'klang:state:v1';
 const audio = $('#audio');
@@ -95,7 +101,7 @@ function saveState() {
     const ids = new Set([...S.queue, ...(S.order || []), ...S.recent]);
     const eph = [...ids].map((id) => S.tracks.get(id)).filter((t) => t && !t.saved);
     localStorage.setItem(LS_KEY, JSON.stringify({
-      queue: S.queue, order: S.order, index: S.index, time: audio.currentTime || 0,
+      queue: S.queue, order: S.order, index: S.index, time: E.time || 0, video: S.video,
       shuffle: S.shuffle, repeat: S.repeat, recent: S.recent, context: S.context, sort: S.sort, eph,
     }));
   } catch { /* Speicher voll oder privat */ }
@@ -115,6 +121,7 @@ function loadState() {
   S.recent = (st.recent || []).filter(ok);
   S.context = st.context || '';
   S.sort = st.sort || 'added';
+  S.video = st.video === 'small' ? 'small' : 'big';
   if (cur()) loadIndex(S.index, { autoplay: false, at: st.time || 0 });
 }
 
@@ -344,7 +351,54 @@ let pendingSeek = 0;
 let errStreak = 0;
 let lastSave = 0;
 
-function setSource(t) {
+/* Zwei Wiedergabe-Arten: <audio> für eigene/freie Songs, YouTube-Player für YouTube */
+let mode = 'audio';
+let ytP = null;
+let ytReadyP = null;
+let ytState = -1;
+let ytLoadedId = '';
+let ytHidden = false;
+
+const E = {
+  get paused() { return mode === 'yt' ? !(ytState === 1 || ytState === 3) : audio.paused; },
+  get time() { return mode === 'yt' ? (ytP?.getCurrentTime?.() || 0) : audio.currentTime; },
+  get duration() {
+    if (mode === 'yt') { const d = ytP?.getDuration?.(); return d > 0 ? d : (cur()?.duration || 0); }
+    return audio.duration;
+  },
+  get loaded() { return mode === 'yt' ? !!ytLoadedId : !!audio.currentSrc; },
+  play() {
+    if (mode === 'yt') {
+      if (ytHidden) { ytHidden = false; showVideo(true); }
+      ytP?.playVideo?.();
+    } else playSafe();
+  },
+  pause() { if (mode === 'yt') ytP?.pauseVideo?.(); else audio.pause(); },
+  seek(t) {
+    if (mode === 'yt') ytP?.seekTo?.(t, true);
+    else audio.currentTime = t;
+    updatePositionState();
+  },
+};
+
+function clearAudio() {
+  const old = objURL;
+  objURL = null;
+  audio.pause();
+  audio.removeAttribute('src');
+  audio.load();
+  if (old) URL.revokeObjectURL(old);
+}
+
+function setSource(t, autoplay, at) {
+  if (t.source === 'yt') {
+    if (mode !== 'yt') clearAudio();
+    mode = 'yt';
+    ytLoad(t.ytId, autoplay, at);
+    return true;
+  }
+  if (mode === 'yt') stopYT();
+  mode = 'audio';
   const old = objURL;
   objURL = null;
   const blob = S.audio.get(t.id);
@@ -369,17 +423,175 @@ function loadIndex(i, { autoplay = true, at = 0 } = {}) {
   if (!S.queue.length) return;
   S.index = Math.max(0, Math.min(i, S.queue.length - 1));
   const t = cur();
-  if (!t || !setSource(t)) {
+  if (!t || !setSource(t, autoplay, at)) {
     toast('Song nicht verfügbar');
     return;
   }
-  pendingSeek = at;
+  pendingSeek = mode === 'yt' ? 0 : at;
   if (autoplay) {
-    playSafe();
+    if (mode === 'audio') playSafe();
     S.recent = [t.id, ...S.recent.filter((x) => x !== t.id)].slice(0, 30);
   }
   updateNowPlaying();
   saveState();
+}
+
+/* ---------- YouTube-Player ---------- */
+function ensureYT() {
+  if (ytReadyP) return ytReadyP;
+  ytReadyP = loadApi().then((YT) => new Promise((resolve, reject) => {
+    const tm = setTimeout(() => reject(new Error('Zeitüberschreitung')), 20000);
+    ytP = new YT.Player('yt-frame', {
+      width: '100%',
+      height: '100%',
+      host: 'https://www.youtube-nocookie.com',
+      playerVars: { playsinline: 1, rel: 0, autoplay: 0, enablejsapi: 1, origin: location.origin },
+      events: {
+        onReady: () => { clearTimeout(tm); resolve(ytP); },
+        onStateChange: onYTState,
+        onError: onYTError,
+      },
+    });
+  })).catch((e) => {
+    ytReadyP = null;
+    ytP = null;
+    $('#yt-box').innerHTML = '<div id="yt-frame"></div>';
+    throw e;
+  });
+  return ytReadyP;
+}
+
+async function ytLoad(id, autoplay, at = 0) {
+  ytLoadedId = id;
+  ytState = -1;
+  ytHidden = false;
+  showVideo(true);
+  try {
+    await ensureYT();
+  } catch {
+    if (mode === 'yt') toast('YouTube ist gerade nicht erreichbar');
+    return;
+  }
+  if (mode !== 'yt' || cur()?.ytId !== id) return;
+  const o = { videoId: id, startSeconds: Math.floor(at) || 0 };
+  if (autoplay) ytP.loadVideoById(o);
+  else ytP.cueVideoById(o);
+}
+
+function stopYT() {
+  try { ytP?.stopVideo?.(); } catch { /* ignorieren */ }
+  ytLoadedId = '';
+  ytState = -1;
+  showVideo(false);
+}
+
+function onYTState(e) {
+  if (mode !== 'yt') return;
+  ytState = e.data;
+  const t = cur();
+  if (e.data === 1 && t) {
+    errStreak = 0;
+    const d = ytP.getDuration?.();
+    let dirty = false;
+    if (d > 0 && Math.abs((t.duration || 0) - d) > 1) { t.duration = d; dirty = true; }
+    if (t.needsTitle) {
+      const vd = ytP.getVideoData?.();
+      if (vd?.title) {
+        const m = cleanMeta(vd.title, vd.author);
+        t.title = m.title;
+        t.artist = m.artist || t.artist;
+        delete t.needsTitle;
+        dirty = true;
+        updateNowPlaying();
+        render();
+      }
+    }
+    if (dirty && t.saved) db.put('tracks', t).catch(() => {});
+  }
+  if (e.data === 0) onEnded();
+  if (e.data === 2) saveState();
+  syncPlayState();
+  updateProgress();
+}
+
+function onYTError(e) {
+  if (mode !== 'yt') return;
+  errStreak++;
+  ytState = -1;
+  syncPlayState();
+  toast(e.data === 101 || e.data === 150
+    ? 'Dieses Video darf nur auf YouTube selbst laufen – überspringe'
+    : 'Video kann nicht abgespielt werden – überspringe');
+  if (errStreak < S.queue.length) setTimeout(() => next(true), 900);
+}
+
+setInterval(() => { if (mode === 'yt' && ytLoadedId) onTick(); }, 500);
+
+/* ---------- Video-Fenster ---------- */
+const ytWrap = $('#yt-wrap');
+const ytBox = $('#yt-box');
+const BAR_H = 36;
+
+function showVideo(on) {
+  ytWrap.hidden = !on;
+  document.body.classList.toggle('has-video', on);
+  updateVideoButtons();
+  layoutVideo();
+}
+
+function offsetIn(el, root) {
+  let x = 0, y = 0, n = el;
+  while (n && n !== root) { x += n.offsetLeft; y += n.offsetTop; n = n.offsetParent; }
+  return { x, y, w: el.offsetWidth, h: el.offsetHeight };
+}
+
+function layoutVideo() {
+  if (ytWrap.hidden) { document.body.style.setProperty('--videoh', '0px'); return; }
+  const big = S.video !== 'small';
+  const open = player.classList.contains('open');
+  const vw = document.documentElement.clientWidth;
+  let x, y, w, h;
+  if (open) {
+    const r = offsetIn($('#p-art'), player);
+    const pad = 18;
+    const ah = Math.max(200, r.h - pad * 2);
+    w = big ? Math.max(200, r.w) : 200;
+    h = big ? Math.max(200, Math.min(ah, Math.round(w * 9 / 16))) : 200;
+    x = r.x + (r.w - w) / 2;
+    y = r.y + pad + (ah - h) / 2;
+  } else {
+    w = big ? Math.min(vw - 16, 440) : 200;
+    h = big ? Math.max(200, Math.round(w * 9 / 16)) : 200;
+    const miniTop = document.body.classList.contains('has-mini')
+      ? mini.getBoundingClientRect().top
+      : $('#tabs').getBoundingClientRect().top;
+    x = vw - w - 8;
+    y = miniTop - 8 - h - BAR_H;
+  }
+  ytWrap.classList.toggle('floating', !open);
+  ytWrap.style.left = `${Math.round(x)}px`;
+  ytWrap.style.top = `${Math.round(y)}px`;
+  ytWrap.style.width = `${Math.round(w)}px`;
+  ytBox.style.height = `${Math.round(h)}px`;
+  document.body.style.setProperty('--videoh', open ? '0px' : `${h + BAR_H + 8}px`);
+}
+window.addEventListener('resize', layoutVideo);
+
+function setVideoSize(size) {
+  S.video = size;
+  saveState();
+  updateVideoButtons();
+  layoutVideo();
+}
+
+function updateVideoButtons() {
+  const isYT = cur()?.source === 'yt';
+  const big = S.video !== 'small';
+  const b = $('#p-video');
+  b.hidden = !isYT;
+  b.innerHTML = (big ? I.shrink : I.expand) + `<span>${big ? 'Video klein' : 'Video groß'}</span>`;
+  $('#yt-size').innerHTML = big ? I.shrink : I.expand;
+  $('#yt-size').setAttribute('aria-label', big ? 'Video verkleinern' : 'Video vergrößern');
 }
 
 function playList(ids, start = 0, { shuffle = false, context = '' } = {}) {
@@ -408,11 +620,11 @@ function toggle() {
     if (all.length) playList(all, 0, { context: 'Alle Songs' });
     return;
   }
-  if (audio.paused) {
-    if (!audio.currentSrc) loadIndex(S.index);
-    else playSafe();
+  if (E.paused) {
+    if (!E.loaded) loadIndex(S.index);
+    else E.play();
   } else {
-    audio.pause();
+    E.pause();
   }
 }
 
@@ -429,9 +641,9 @@ function next(auto = false) {
 }
 
 function prev() {
-  if (audio.currentTime > 3 || S.index <= 0) {
-    audio.currentTime = 0;
-    if (audio.paused) playSafe();
+  if (E.time > 3 || S.index <= 0) {
+    E.seek(0);
+    if (E.paused) E.play();
     return;
   }
   loadIndex(S.index - 1);
@@ -492,8 +704,8 @@ function removeFromQueue(i) {
   saveState();
 }
 
-/* Audio-Ereignisse */
-audio.addEventListener('ended', () => {
+/* Gemeinsame Ereignisse */
+function onEnded() {
   if (S.sleepEnd) {
     S.sleepEnd = false;
     updateSleepButton();
@@ -502,12 +714,27 @@ audio.addEventListener('ended', () => {
     return;
   }
   if (S.repeat === 'one') {
-    audio.currentTime = 0;
-    playSafe();
+    E.seek(0);
+    E.play();
     return;
   }
   next(true);
-});
+}
+
+function onTick() {
+  updateProgress();
+  if (S.sleepAt && Date.now() >= S.sleepAt) {
+    S.sleepAt = 0;
+    E.pause();
+    updateSleepButton();
+    toast('Sleep-Timer: Wiedergabe pausiert');
+  }
+  const now = Date.now();
+  if (now - lastSave > 5000) { lastSave = now; saveState(); }
+}
+
+/* Audio-Ereignisse */
+audio.addEventListener('ended', () => { if (mode === 'audio') onEnded(); });
 audio.addEventListener('playing', () => { errStreak = 0; });
 audio.addEventListener('play', syncPlayState);
 audio.addEventListener('pause', () => { syncPlayState(); saveState(); });
@@ -522,21 +749,11 @@ audio.addEventListener('loadedmetadata', () => {
   updateProgress();
   updatePositionState();
 });
-audio.addEventListener('timeupdate', () => {
-  updateProgress();
-  if (S.sleepAt && Date.now() >= S.sleepAt) {
-    S.sleepAt = 0;
-    audio.pause();
-    updateSleepButton();
-    toast('Sleep-Timer: Wiedergabe pausiert');
-  }
-  const now = Date.now();
-  if (now - lastSave > 5000) { lastSave = now; saveState(); }
-});
+audio.addEventListener('timeupdate', () => { if (mode === 'audio') onTick(); });
 audio.addEventListener('seeked', updatePositionState);
 audio.addEventListener('ratechange', updatePositionState);
 audio.addEventListener('error', () => {
-  if (!audio.getAttribute('src')) return;
+  if (mode !== 'audio' || !audio.getAttribute('src')) return;
   const t = cur();
   errStreak++;
   syncPlayState();
@@ -553,18 +770,14 @@ function setupMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const ms = navigator.mediaSession;
   const h = (a, fn) => { try { ms.setActionHandler(a, fn); } catch { /* nicht unterstützt */ } };
-  h('play', () => { if (!audio.currentSrc) loadIndex(S.index); else playSafe(); });
-  h('pause', () => audio.pause());
-  h('stop', () => audio.pause());
+  h('play', () => { if (!E.loaded) loadIndex(S.index); else E.play(); });
+  h('pause', () => E.pause());
+  h('stop', () => E.pause());
   h('previoustrack', prev);
   h('nexttrack', () => next(false));
-  h('seekbackward', (d) => { audio.currentTime = Math.max(0, audio.currentTime - (d.seekOffset || 10)); });
-  h('seekforward', (d) => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + (d.seekOffset || 10)); });
-  h('seekto', (d) => {
-    if (d.fastSeek && audio.fastSeek) audio.fastSeek(d.seekTime);
-    else audio.currentTime = d.seekTime;
-    updatePositionState();
-  });
+  h('seekbackward', (d) => E.seek(Math.max(0, E.time - (d.seekOffset || 10))));
+  h('seekforward', (d) => E.seek(Math.min(E.duration || 0, E.time + (d.seekOffset || 10))));
+  h('seekto', (d) => E.seek(d.seekTime));
 }
 
 function updateMediaMetadata(t) {
@@ -581,9 +794,9 @@ function updateMediaMetadata(t) {
 function updatePositionState() {
   const ms = navigator.mediaSession;
   if (!ms?.setPositionState) return;
-  const d = audio.duration;
+  const d = E.duration;
   if (!isFinite(d) || d <= 0) return;
-  try { ms.setPositionState({ duration: d, playbackRate: audio.playbackRate || 1, position: Math.min(audio.currentTime, d) }); } catch { /* ignorieren */ }
+  try { ms.setPositionState({ duration: d, playbackRate: mode === 'audio' ? audio.playbackRate || 1 : 1, position: Math.min(E.time, d) }); } catch { /* ignorieren */ }
 }
 
 /* =========================================================
@@ -601,7 +814,7 @@ function updateNowPlaying() {
   $('#m-art').innerHTML = artHTML(t, '');
   $('#m-title').textContent = t.title;
   $('#m-artist').textContent = t.artist || 'Unbekannt';
-  $('#p-art').innerHTML = artHTML(t, '');
+  $('#p-art').innerHTML = t.source === 'yt' ? '' : artHTML(t, '');
   $('#p-title').textContent = t.title;
   $('#p-artist').textContent = t.artist || 'Unbekannt';
   $('#p-ctx').textContent = S.context || t.album || 'Warteschlange';
@@ -615,6 +828,8 @@ function updateNowPlaying() {
   syncPlayState();
   updateProgress();
   markPlaying();
+  updateVideoButtons();
+  layoutVideo();
 }
 
 function markPlaying() {
@@ -623,7 +838,7 @@ function markPlaying() {
 }
 
 function syncPlayState() {
-  const paused = audio.paused;
+  const paused = E.paused;
   document.body.classList.toggle('paused', paused);
   const icon = paused ? I.play : I.pause;
   $('#m-play').innerHTML = icon;
@@ -639,8 +854,8 @@ function syncPlayState() {
 }
 
 function updateProgress() {
-  const d = audio.duration || cur()?.duration || 0;
-  const c = audio.currentTime || pendingSeek || 0;
+  const d = E.duration || cur()?.duration || 0;
+  const c = E.time || pendingSeek || 0;
   const pct = d ? (c / d) * 100 : 0;
   $('#m-bar').style.width = pct + '%';
   if (!seeking) {
@@ -687,11 +902,11 @@ seek.addEventListener('input', () => {
 });
 seek.addEventListener('change', () => {
   seeking = false;
-  if (!audio.currentSrc && cur()) {
+  if (!E.loaded && cur()) {
     pendingSeek = Number(seek.value);
     return;
   }
-  audio.currentTime = Number(seek.value);
+  E.seek(Number(seek.value));
 });
 
 function openPlayer() {
@@ -700,6 +915,7 @@ function openPlayer() {
   player.setAttribute('aria-hidden', 'false');
   document.body.classList.add('no-scroll');
   history.pushState({ player: 1 }, '');
+  layoutVideo();
 }
 // Geht einen Verlaufsschritt zurück und wartet, bis das passiert ist
 function popHistory() {
@@ -716,6 +932,7 @@ function closePlayer(fromPop = false) {
   player.classList.remove('open');
   player.setAttribute('aria-hidden', 'true');
   document.body.classList.remove('no-scroll');
+  layoutVideo();
   if (!fromPop && history.state?.player) return popHistory();
   return Promise.resolve();
 }
@@ -787,11 +1004,11 @@ function trackHead(t) {
   return `<div class="sheet-head">${artHTML(t, 'art-s')}<div style="min-width:0"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || 'Unbekannt')}</div></div></div>`;
 }
 
-function promptSheet({ title, value = '', placeholder = '', ok = 'Speichern', type = 'text', extra = '' }) {
+function promptSheet({ title, value = '', placeholder = '', ok = 'Speichern', type = 'text', extra = '', desc = '', required = true }) {
   return new Promise((resolve) => {
     openSheet(`<form class="sheet-form" id="prompt-form">
-      <h3>${esc(title)}</h3>
-      <input type="${type}" id="prompt-input" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" required>
+      <h3>${esc(title)}</h3>${desc}
+      <input type="${type}" id="prompt-input" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" ${required ? 'required' : ''}>
       ${extra}
       <div class="actions"><button type="button" class="btn ghost" data-act="sheet-cancel">Abbrechen</button><button class="btn primary">${esc(ok)}</button></div>
     </form>`);
@@ -803,8 +1020,7 @@ function promptSheet({ title, value = '', placeholder = '', ok = 'Speichern', ty
       e.preventDefault();
       const vals = Object.fromEntries($$('input', form).map((i) => [i.id, i.value.trim()]));
       sheetResolve = null;
-      closeSheet();
-      resolve(extra ? vals : vals['prompt-input']);
+      closeSheet().then(() => resolve(extra ? vals : vals['prompt-input']));
     });
   });
 }
@@ -814,7 +1030,7 @@ function confirmSheet(title, text, ok = 'Löschen') {
     openSheet(`<div class="sheet-form"><h3>${esc(title)}</h3><p>${esc(text)}</p>
       <div class="actions"><button class="btn ghost" data-act="sheet-cancel">Abbrechen</button><button class="btn primary" id="confirm-ok">${esc(ok)}</button></div></div>`);
     sheetResolve = resolve;
-    $('#confirm-ok').addEventListener('click', () => { sheetResolve = null; closeSheet(); resolve(true); });
+    $('#confirm-ok').addEventListener('click', () => { sheetResolve = null; closeSheet().then(() => resolve(true)); });
   });
 }
 
@@ -924,8 +1140,8 @@ async function deleteTrack(t) {
   if (t.source === 'local') S.tracks.delete(t.id);
   else { t.saved = false; t.offline = false; t.liked = false; }
   if (wasCurrent) {
-    if (S.queue.length) loadIndex(Math.min(S.index, S.queue.length - 1), { autoplay: !audio.paused });
-    else { audio.pause(); audio.removeAttribute('src'); audio.load(); S.index = -1; updateNowPlaying(); }
+    if (S.queue.length) loadIndex(Math.min(S.index, S.queue.length - 1), { autoplay: !E.paused });
+    else { if (mode === 'yt') stopYT(); else clearAudio(); S.index = -1; updateNowPlaying(); }
   }
   saveState();
   toast('Gelöscht');
@@ -953,6 +1169,7 @@ function trackMenu(id, plId) {
       { icon: I.next1, label: 'Als Nächstes spielen', run: () => playNext(id) },
       { icon: I.addq, label: 'Zur Warteschlange', run: () => addToQueue(id) },
       t.iaId && { icon: I.disc, label: 'Zum Album', run: async () => { await closePlayer(); go(`#album/${encodeURIComponent(t.iaId)}`); } },
+      t.source === 'yt' && { icon: I.yt, label: 'Auf YouTube öffnen', run: () => window.open(`https://www.youtube.com/watch?v=${encodeURIComponent(t.ytId)}`, '_blank', 'noopener') },
       t.source === 'ia' && !t.offline && { icon: I.download, label: 'Offline verfügbar machen', run: () => downloadTrack(t) },
       t.source === 'ia' && t.offline && { icon: I.x, label: 'Download entfernen', run: () => removeOffline(t) },
       pl && { icon: I.x, label: 'Aus dieser Playlist entfernen', run: async () => {
@@ -1220,17 +1437,37 @@ function searchView() {
     </form>
     <div id="results"></div>`;
   const q = $('#q');
-  let timer;
+  let timer, ytTimer;
   q.addEventListener('input', () => {
     S.searchQ = q.value;
     $('[data-act="clear-search"]').hidden = !q.value;
     clearTimeout(timer);
+    clearTimeout(ytTimer);
     renderLocalResults();
     timer = setTimeout(renderRemoteResults, 450);
+    // YouTube etwas später, um das Tageskontingent zu schonen
+    ytTimer = setTimeout(renderYTResults, 1200);
   });
-  $('#search-form').addEventListener('submit', (e) => { e.preventDefault(); q.blur(); clearTimeout(timer); renderRemoteResults(); });
+  $('#search-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    q.blur();
+    clearTimeout(timer);
+    clearTimeout(ytTimer);
+    renderRemoteResults();
+    renderYTResults();
+  });
   renderLocalResults();
   renderRemoteResults();
+  renderYTResults();
+}
+
+function ytSetupCard(compact = false) {
+  if (ytKey.get()) {
+    return `<div class="yt-card"><p>${I.check} YouTube-Suche ist aktiv. Du kannst auch einen Link direkt einfügen.</p>
+      <div class="actions"><button class="btn" data-act="yt-link">${I.link}Link einfügen</button><button class="btn ghost" data-act="yt-key">${I.key}Schlüssel ändern</button></div></div>`;
+  }
+  return `<div class="yt-card"><p>${compact ? '' : 'Fast jeden Song über YouTube finden: '}Richte einmalig einen kostenlosen YouTube-Schlüssel ein – oder füge einen YouTube-Link ein.</p>
+    <div class="actions"><button class="btn primary" data-act="yt-key">${I.key}YouTube-Suche einrichten</button><button class="btn" data-act="yt-link">${I.link}Link einfügen</button></div></div>`;
 }
 
 function renderLocalResults() {
@@ -1238,7 +1475,8 @@ function renderLocalResults() {
   if (!box) return;
   const q = S.searchQ.trim().toLowerCase();
   if (!q) {
-    box.innerHTML = `<h2>Freie Musik entdecken</h2><div class="genre-grid">${GENRES.map(([label, gq, hue]) =>
+    box.innerHTML = `<h2>YouTube</h2>${ytSetupCard()}
+      <h2>Freie Musik entdecken</h2><div class="genre-grid">${GENRES.map(([label, gq, hue]) =>
       `<button class="genre" style="--h:${hue}" data-act="genre" data-q="${esc(gq)}">${esc(label)}</button>`).join('')}</div>
       <p class="note">Freie Musik stammt aus dem Internet Archive (Netlabels, Live-Mitschnitte, gemeinfreie Aufnahmen) – legal und ohne Werbung.</p>`;
     return;
@@ -1249,7 +1487,74 @@ function renderLocalResults() {
     return words.every((w) => hay.includes(w));
   }).slice(0, 50).map((t) => t.id);
   const local = hits.length ? `<h2>In deiner Bibliothek</h2>${listHTML(hits, { ctx: `Suche: ${S.searchQ}` }).html}` : '';
-  box.innerHTML = `<div id="local-res">${local}</div><div id="remote-res"><h2>Freie Musik</h2><div class="spinner"></div></div>`;
+  const yt = ytKey.get() ? '<h2>YouTube</h2><div class="spinner"></div>' : `<h2>YouTube</h2>${ytSetupCard(true)}`;
+  box.innerHTML = `<div id="local-res">${local}</div><div id="yt-res">${yt}</div><div id="remote-res"><h2>Freie Musik</h2><div class="spinner"></div></div>`;
+}
+
+async function renderYTResults() {
+  const q = S.searchQ.trim();
+  const key = ytKey.get();
+  if (!q || !key || !$('#yt-res')) return;
+  try {
+    const res = await ytSearch(q, key);
+    if (S.searchQ.trim() !== q || !$('#yt-res')) return;
+    const ids = res.map((r) => addTrack({
+      id: `yt:${r.videoId}`, source: 'yt', ytId: r.videoId,
+      title: r.title, artist: r.artist, album: '', coverUrl: thumb(r.videoId),
+      duration: r.duration, liked: false, offline: false, saved: false,
+    }).id);
+    $('#yt-res').innerHTML = `<h2>YouTube</h2>${ids.length
+      ? listHTML(ids, { ctx: `YouTube: ${q}` }).html
+      : '<div class="empty">Auf YouTube nichts gefunden.</div>'}`;
+    markPlaying();
+  } catch (e) {
+    console.warn(e);
+    if (!$('#yt-res')) return;
+    const r = e.reason || '';
+    let msg = navigator.onLine ? 'YouTube-Suche gerade nicht erreichbar.' : 'Du bist offline.';
+    if (/quota/i.test(r)) msg = 'Das Tageslimit der YouTube-Suche ist erreicht. Morgen geht es wieder – Links einfügen klappt weiterhin.';
+    else if (/key|INVALID_ARGUMENT|forbidden|PERMISSION|accessNotConfigured|API_KEY/i.test(r) || /API key/i.test(e.message)) msg = 'Der YouTube-Schlüssel funktioniert nicht. Prüfe, ob die „YouTube Data API v3“ aktiviert ist.';
+    $('#yt-res').innerHTML = `<h2>YouTube</h2><div class="yt-card"><p>${esc(msg)}</p><div class="actions"><button class="btn" data-act="yt-key">${I.key}Schlüssel ändern</button><button class="btn" data-act="yt-link">${I.link}Link einfügen</button></div></div>`;
+  }
+}
+
+async function ytKeySheet() {
+  const v = await promptSheet({
+    title: 'YouTube-Suche einrichten',
+    desc: `<ol>
+      <li>Öffne <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener">die Google Cloud Console</a> und melde dich mit deinem Google-Konto an.</li>
+      <li>Lege ein Projekt an (z. B. „Klang“) und tippe bei <b>YouTube Data API v3</b> auf <b>Aktivieren</b>.</li>
+      <li>Gehe zu <b>APIs &amp; Dienste → Anmeldedaten → Anmeldedaten erstellen → API-Schlüssel</b>.</li>
+      <li>Kopiere den Schlüssel und füge ihn hier ein.</li>
+    </ol><p style="text-align:left;margin:0 0 12px">Kostenlos, keine Kreditkarte nötig. Der Schlüssel bleibt nur auf diesem Gerät gespeichert. Leer lassen und speichern löscht ihn.</p>`,
+    value: ytKey.get(),
+    placeholder: 'AIza…',
+    required: false,
+  });
+  if (v === null) return;
+  ytKey.set(v);
+  toast(v ? 'YouTube-Suche aktiviert' : 'Schlüssel gelöscht');
+  if (currentRoute().name === 'search') render();
+}
+
+async function ytLinkSheet() {
+  const v = await promptSheet({ title: 'YouTube-Link einfügen', type: 'url', placeholder: 'https://youtu.be/…', ok: 'Abspielen' });
+  if (!v) return;
+  const id = parseYouTubeId(v);
+  if (!id) return toast('Das ist kein gültiger YouTube-Link');
+  let t = S.tracks.get(`yt:${id}`);
+  if (!t) {
+    t = addTrack({
+      id: `yt:${id}`, source: 'yt', ytId: id, title: 'YouTube-Video', artist: '', album: '',
+      coverUrl: thumb(id), duration: 0, addedAt: Date.now(), liked: false, offline: false, saved: false, needsTitle: true,
+    });
+    const meta = await ytTitle(id);
+    if (meta) { t.title = meta.title; t.artist = meta.artist; delete t.needsTitle; }
+  }
+  if (!t.saved) { t.addedAt = Date.now(); await persistTrack(t); }
+  playList([t.id], 0, { context: 'YouTube' });
+  toast('Zur Bibliothek hinzugefügt');
+  render();
 }
 
 async function renderRemoteResults() {
@@ -1322,7 +1627,7 @@ const actions = {
   row(el) {
     const { ids, ctx } = listOf(el);
     const i = Number(el.dataset.i);
-    if (S.queue[S.index] === el.dataset.id && S.context === ctx && audio.currentSrc) return toggle();
+    if (S.queue[S.index] === el.dataset.id && S.context === ctx && E.loaded) return toggle();
     playList(ids, i, { context: ctx });
   },
   more(el) {
@@ -1370,6 +1675,8 @@ const actions = {
           const p = await createPlaylist(name);
           go(`#playlist/${p.id}`);
         }, 320) },
+        { icon: I.yt, label: 'YouTube-Link einfügen', run: () => setTimeout(ytLinkSheet, 320) },
+        { icon: I.key, label: 'YouTube-Suche einrichten', run: () => setTimeout(ytKeySheet, 320) },
         { icon: I.link, label: 'Song per Link (MP3-URL)', run: () => setTimeout(addLink, 320) },
         { icon: I.globe, label: 'Freie Musik entdecken', run: () => go('#search') },
       ],
@@ -1403,6 +1710,15 @@ const actions = {
     else go('#home');
   },
   retry: () => render(),
+  'yt-key': () => ytKeySheet(),
+  'yt-link': () => ytLinkSheet(),
+  'video-size': () => setVideoSize(S.video === 'small' ? 'big' : 'small'),
+  'open-player': () => openPlayer(),
+  'video-close'() {
+    E.pause();
+    ytHidden = true;
+    showVideo(false);
+  },
 };
 
 document.addEventListener('click', (e) => {

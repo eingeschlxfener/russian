@@ -1,7 +1,7 @@
 // Service Worker: App läuft auch offline und startet sofort.
-const VERSION = 'klang-v1';
+const VERSION = 'klang-v2';
 const SHELL = [
-  './', './index.html', './styles.css', './app.js', './db.js', './id3.js',
+  './', './index.html', './styles.css', './app.js', './db.js', './id3.js', './youtube.js',
   './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png',
 ];
 

@@ -69,10 +69,23 @@
       </div>
       <div class="player-foot">
         <button class="icon-btn" data-act="sleep" id="p-sleep" aria-label="Sleep-Timer" data-icon="moon"></button>
+        <button class="pill-btn" data-act="video-size" id="p-video" hidden></button>
         <button class="icon-btn" data-act="queue" aria-label="Warteschlange" data-icon="queue"></button>
       </div>
     </div>
   </section>
+
+ <div id="yt-wrap" class="yt-wrap" hidden>
+    <div class="yt-bar">
+      <span class="yt-label" data-icon="yt">YouTube</span>
+      <span>
+        <button class="icon-btn" data-act="video-size" id="yt-size" aria-label="Video verkleinern"></button>
+        <button class="icon-btn" data-act="open-player" aria-label="Player öffnen" data-icon="down" style="transform:rotate(180deg)"></button>
+        <button class="icon-btn" data-act="video-close" aria-label="Video stoppen und ausblenden" data-icon="x"></button>
+      </span>
+    </div>
+    <div class="yt-box" id="yt-box"><div id="yt-frame"></div></div>
+  </div>
 
   <div id="sheet-backdrop" class="sheet-backdrop"></div>
   <div id="sheet" class="sheet" role="dialog" aria-modal="true"></div>
